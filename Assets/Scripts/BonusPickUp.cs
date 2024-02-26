@@ -1,6 +1,7 @@
+using Unity.Netcode;
 using UnityEngine;
 
-public class BonusPickUp : MonoBehaviour
+public class BonusPickUp : NetworkBehaviour
 {
     // Recommended values of multiplier:
     // Run, Throw Size - 1.5, Throw Force - 3, Throw Speed - 2, 0 - for bonuses, which not using it
@@ -15,9 +16,12 @@ public class BonusPickUp : MonoBehaviour
 
     private void OnTriggerEnter2D(Collider2D collision)
     {
+        if (!IsServer) return;
+
         if (collision.CompareTag("Player"))
         {
-            collision.GetComponent<PlayerController>().BonusPickUp(bonusType, bonusTime, multiplier);
+            collision.GetComponent<PlayerController>().BonusPickUpClientRpc(bonusType, bonusTime, multiplier);
         }
+        gameObject.GetComponent<NetworkObject>().Despawn();
     }
 }

@@ -1,9 +1,17 @@
 using System.Collections;
 using System.Collections.Generic;
+using TMPro;
+using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
+using Unity.Netcode;
 using UnityEngine;
+using UnityEngine.U2D.Animation;
 
 [RequireComponent(typeof(Rigidbody2D))]
-public class PlayerController : MonoBehaviour
+[RequireComponent(typeof(Animator))]
+[RequireComponent(typeof(SpriteRenderer))]
+[RequireComponent(typeof(NetworkObject))]
+public class PlayerController : NetworkBehaviour
 {
     private Rigidbody2D _rb;
     private Animator _animator;
@@ -17,11 +25,17 @@ public class PlayerController : MonoBehaviour
     private List<AudioClip> footstepAudioClips = new List<AudioClip>();
     private float _horizontalInput;
     private float _verticalInput;
-    private bool isFacingRight = true;
     private float _moveLimiter = 0.7f;
     private float _nextThrow = 0f;
-    private int _health = 3;
 
+    [SerializeField]
+    private NetworkVariable<int> _health = new NetworkVariable<int>(3);
+    private NetworkVariable<bool> _isFlipped = new NetworkVariable<bool>(false, writePerm: NetworkVariableWritePermission.Owner);
+    public NetworkVariable<FixedString32Bytes> nickName = new NetworkVariable<FixedString32Bytes>(writePerm: NetworkVariableWritePermission.Owner);
+    private NetworkVariable<int> _avatarIndex = new NetworkVariable<int>(writePerm: NetworkVariableWritePermission.Owner);
+
+    [SerializeField]
+    private TMP_Text _nickNameText;
     [SerializeField]
     private string[] statuses = new string[3];
     [SerializeField]
@@ -37,20 +51,131 @@ public class PlayerController : MonoBehaviour
     [SerializeField]
     private float runSpeed = 7f;
     [SerializeField]
-    private GameObject snowballPrefab;
+    private Transform snowballPrefab;
+    private Transform _spawnedSnowball;
+    private bool _isDead;
+    private SpriteLibrary _spriteLibrary;
+    private ulong _lastDamagePlayerId;
 
-    private void Start()
+    public static PlayerController thisClientPlayer;
+
+    private void Awake()
     {
         _rb = GetComponent<Rigidbody2D>();
         _animator = GetComponent<Animator>();
         _spriteRenderer = GetComponent<SpriteRenderer>();
+        _spriteLibrary = GetComponent<SpriteLibrary>();
         _mainCamera = Camera.main;
+        thisClientPlayer = this;
 
-        BonusPickUp(BonusType.Invinsible, 2f);
+        BonusPickUpClientRpc(BonusType.Invinsible, 3f);
+
+        DontDestroyOnLoad(gameObject);
+        DontDestroyOnLoad(_mainCamera);
     }
+
+    public override void OnNetworkSpawn()
+    {
+        _isFlipped.OnValueChanged += OnFlipChange;
+        _health.OnValueChanged += OnHealthChange;
+        nickName.OnValueChanged += OnNicknameChange;
+        _avatarIndex.OnValueChanged += OnAvatarIndexChange;
+        //NetworkManager.Singleton.OnClientConnectedCallback += OnClientConnected;
+        // Update Avatars of others for a new client / player
+        _spriteLibrary.spriteLibraryAsset = PlayerSpawner.Instance.GetAvatarByIndex(_avatarIndex.Value);
+
+
+        RespawnClientRpc();
+
+        if (IsServer)
+        {
+            GameController.Instance.AddPlayer(OwnerClientId, this);
+            //RespawnClientRpc();
+        }
+
+        if (!IsOwner) return;
+
+        Debug.Log($"Input field text: {MainMenu.Instance.nicknameInputField.text}");
+        if (MainMenu.Instance.nicknameInputField.text != "")
+        {
+            nickName.Value = MainMenu.Instance.nicknameInputField.text;
+        }
+        else
+        {
+            nickName.Value = $"Player: {OwnerClientId}";
+        }
+        MainMenu.Instance.nicknameInputField.onEndEdit.AddListener(OnNicknameInput);
+        //MainMenu.Instance.nicknameInputField.onValueChanged.AddListener(OnNicknameInput);
+
+        Camera.SetupCurrent(Camera.main);
+    }
+
+    public override void OnNetworkDespawn()
+    {
+        GameController.Instance.RemovePlayer(OwnerClientId);
+    }
+
+    #region OnChangeEvents
+
+    private void OnAvatarIndexChange(int previousValue, int newValue)
+    {
+        _spriteLibrary.spriteLibraryAsset = PlayerSpawner.Instance.GetAvatarByIndex(newValue);
+    }
+
+    public void OnNicknameInput(string text)
+    {
+        // Max Nickname size = 16 character to fit in FixedString32Bytes
+        if (text.Length > 9)
+        {
+            nickName.Value = text.Substring(0, 16);
+        }
+        else
+        {
+            nickName.Value = text;
+        }
+    }
+
+    private void OnNicknameChange(FixedString32Bytes previousValue, FixedString32Bytes newValue)
+    {
+        _nickNameText.text = newValue.ToString();
+    }
+
+    private void OnFlipChange(bool oldValue, bool newValue)
+    {
+        // Sprite Flip
+        _spriteRenderer.flipX = newValue;
+    }
+
+    private void OnHealthChange(int oldValue, int newValue)
+    {
+        if (IsOwner)
+        {
+            // Update hearts
+            HealthUI.Instance.UpdateHealth(newValue);
+        }
+
+        // Check death
+        if (newValue <= 0)
+        {
+            _isDead = true;
+            _spriteRenderer.color = Color.red;
+            //Debug.Log("Health <= 0. Respawning...");
+            if (IsServer)
+            {
+                GameController.Instance.AddScoreToPlayer(_lastDamagePlayerId);
+                RespawnClientRpc();
+            }
+        }
+    }
+    
+
+    #endregion
+
 
     private void Update()
     {
+        if (!IsOwner || !Application.isFocused || _isDead) return;
+
         // Gives a value between -1 and 1
         _horizontalInput = Input.GetAxisRaw("Horizontal"); // -1 is left
         _verticalInput = Input.GetAxisRaw("Vertical"); // -1 is down
@@ -64,13 +189,13 @@ public class PlayerController : MonoBehaviour
             _animator.SetBool("isMoving", false);
         }
 
-        if (_horizontalInput < 0 && isFacingRight)
+        if (_horizontalInput < 0 && !_isFlipped.Value)
         {
-            Flip();
+            _isFlipped.Value = true;
         }
-        else if (_horizontalInput > 0 && !isFacingRight)
+        else if (_horizontalInput > 0 && _isFlipped.Value)
         {
-            Flip();
+            _isFlipped.Value = false;
         }
 
         if (Input.GetMouseButton(0) && Time.time > _nextThrow)
@@ -84,6 +209,8 @@ public class PlayerController : MonoBehaviour
 
     private void FixedUpdate()
     {
+        if (!IsOwner || !Application.isFocused || _isDead) return;
+
         if (_horizontalInput != 0 && _verticalInput != 0) // Check for diagonal movement
         {
             // limit movement speed diagonally, so you move at 70% speed
@@ -94,47 +221,104 @@ public class PlayerController : MonoBehaviour
         _rb.velocity = new Vector2(_horizontalInput * runSpeed, _verticalInput * runSpeed);
     }
 
+    #region Snowball
     private void ThrowSnowball()
     {
         Vector3 worldMousePos = Camera.main.ScreenToWorldPoint(Input.mousePosition);
-
         Vector2 direction = (Vector2)(worldMousePos - transform.position);
         direction.Normalize();
 
-        var snowball = Instantiate(snowballPrefab, transform.position + (Vector3)(direction * throwOffset), transform.rotation);
-        snowball.transform.localScale *= throwSize;
+        ThrowSnowballServerRpc(direction);
+    }
 
+    [ServerRpc]
+    private void ThrowSnowballServerRpc(Vector2 direction)
+    {
+        ThrowSnowballClientRpc(direction);
+    }
+
+    [ClientRpc]
+    private void ThrowSnowballClientRpc(Vector2 direction)
+    {
+        _spawnedSnowball = SpawnSnowball(direction);
+
+        if (IsHost) _spawnedSnowball.GetComponent<Snowball>().isServerObject = true;
+    }
+
+    private Transform SpawnSnowball(Vector2 direction)
+    {
+        var snowball = Instantiate(snowballPrefab, transform.position + (Vector3)(direction * throwOffset), transform.rotation);
+        snowball.localScale *= throwSize;
+        snowball.right = direction;
         // Give velocity to the snowball
         snowball.GetComponent<Rigidbody2D>().velocity = direction * throwForce;
-
+        snowball.GetComponent<Snowball>().playerOriginId = OwnerClientId;
         throwAudioSource.Play();
+        return snowball;
     }
+    #endregion
 
-    private void Flip()
+
+    public void GetDamage(ulong id)
     {
-        //Vector3 currentScale = transform.localScale;
-        //currentScale.x *= -1;
-        //transform.localScale = currentScale;
-
-        _spriteRenderer.flipX = isFacingRight;
-        isFacingRight = !isFacingRight;
-
-        //UpdateFlipServerRpc(_spriteRenderer.flipX);
-    }
-
-    public void GetDamage()
-    {
-        if(!_isInvincible)
+        if(!_isInvincible && !_isDead)
         {
-            _health--;
-            if(_health <= 0)
-            {
-                // Respawn (Get position from game manager?)
-            }
+            _lastDamagePlayerId = id;
+            _health.Value--;
         }
     }
 
-    public void BonusPickUp(BonusType bonusType, float time, float multiplier = 0) => StartCoroutine(Bonus(bonusType, time, multiplier));
+
+    [ClientRpc]
+    private void RespawnOnLoadClientRpc()
+    {
+        if (IsOwner)
+        {
+            transform.position = PlayerSpawner.Instance.GetSpawnPosition();
+
+            _avatarIndex.Value = PlayerSpawner.Instance.GetRandomAvatarIndex();
+            _spriteLibrary.spriteLibraryAsset = PlayerSpawner.Instance.GetAvatarByIndex(_avatarIndex.Value);
+        }
+        _spriteRenderer.color = Color.white;
+        _isDead = false;
+        BonusPickUpClientRpc(BonusType.Invinsible, 2f);
+    }
+
+    [ClientRpc]
+    public void RespawnClientRpc()
+    {
+        StartCoroutine(Respawn());
+    }
+
+    IEnumerator Respawn()
+    {
+        yield return new WaitForSeconds(1f);
+        if (IsHost)
+        {
+            _health.Value = 3;
+        }
+        if (IsOwner)
+        {
+            transform.position = PlayerSpawner.Instance.GetSpawnPosition();
+
+            _avatarIndex.Value = PlayerSpawner.Instance.GetRandomAvatarIndex();
+            _spriteLibrary.spriteLibraryAsset = PlayerSpawner.Instance.GetAvatarByIndex(_avatarIndex.Value);
+            //UpdateAvatarServerRpc(avatarIndex);
+        }
+        _spriteRenderer.color = Color.white;
+        _isDead = false;
+        BonusPickUpClientRpc(BonusType.Invinsible, 2f);
+    }
+
+    [ClientRpc]
+    public void TeleportClientRpc(Vector3 position)
+    {
+        if (IsOwner)
+            transform.position = position;
+    }
+
+    [ClientRpc]
+    public void BonusPickUpClientRpc(BonusType bonusType, float time, float multiplier = 0) => StartCoroutine(Bonus(bonusType, time, multiplier));
     IEnumerator Bonus(BonusType bonusType, float time, float multiplier = 0)
     {
         switch (bonusType)
@@ -166,8 +350,10 @@ public class PlayerController : MonoBehaviour
                 break;
             case BonusType.Invinsible:
                 _isInvincible = true;
+                _spriteRenderer.color = Color.yellow;
                 yield return new WaitForSeconds(time);
                 _isInvincible = false;
+                _spriteRenderer.color = Color.white;
                 break;
             default:
                 break;
